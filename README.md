@@ -10,10 +10,10 @@ A token launch radar built for the make.fun bounty [token-radar-01](https://make
 
 - **178 pre-token rows** — the whole 40-protocol watchlist (every protocol with at least $50M TVL and no token on record) plus 138 early-radar protocols below the floor that pass the watchlist's own exclusion rule (no bridge, liquid staking/restaking or CEX product, no versioned pool, no wrapped or staked product, no exchange-branded name).
 - **24 live-token protocols set aside** — they already trade, so the board shows their market caps, never a model value. Their market-cap-to-TVL ratios are the comparables the model prices the board with.
-- **A detail view for every protocol** — the model broken down input by input, its live-token peers in the same category, and a 6-step farm plan with a cost and a time for every step.
+- **A detail view for every protocol** — the model broken down input by input, its live-token peers in the same category, and a 6-step farm plan written for its category, with a cost and a time for every step.
 - **Filters that work** — search by name, slug, category or chain; filter by category, chain, minimum TVL, or watchlist-only; sort by implied value, TVL, 7-day growth, age or multiple; a separate Live token tab.
 
-## The model (radar-2)
+## The model (radar-3)
 
 Implied value is TVL times the multiple the protocol's own category trades at, adjusted for growth, age and chain breadth. Nothing is hardcoded by name; every number comes from the snapshot.
 
@@ -24,12 +24,12 @@ implied = round( tvl_usd x category multiple
   x (1 + min(chains - 1, 4) x 0.02) )
 ```
 
-- **Category multiple**: the median market-cap-to-TVL ratio of the live-token protocols in the same category (at least 3 of them, otherwise the global median of 0.21), clamped to 0.05–1.00. Lending trades near 0.13, Dexs near 0.34, RWA near 0.27 — the board prices each category at what its own market pays, not at one flat rate.
+- **Category multiple**: the median market-cap-to-TVL ratio of the live-token protocols in the same category, winsorized to 0.05–1.00 and shrunk toward the global median of 0.21 by (n × category + 3 × global) / (n + 3), clamped to 0.05–1.00. A category with many comparables keeps its own number — Lending trades near 0.15, Dexs near 0.31, RWA near 0.26 — and a thin one is pulled toward what the whole market pays instead of standing on one peer's ratio (Risk Curators has a single comparable at 2.97; the shrink puts it at 0.41, not 1.00).
 - **Growth**: the 7-day TVL change, clamped to −50%…+100% so one spike (the snapshot holds a +4,448% outlier) cannot buy the top rank.
 - **Maturity**: age since first listing, up to 4 years. A protocol that has run longest with no token has had the most time to build the thing a token would price.
 - **Breadth**: a small premium per extra chain, capped at 4.
 
-Top of the board: Steakhouse Financial ($2.75B TVL, Risk Curators, implied ≈ $512M), Gauntlet ($1.58B, implied ≈ $302M), Veda ($1.56B, implied ≈ $290M).
+Top of the board: Steakhouse Financial ($2.75B TVL, Risk Curators, implied ≈ $982M), Gauntlet ($1.58B, implied ≈ $580M), Veda ($1.56B, implied ≈ $201M).
 
 ## Say it plainly
 

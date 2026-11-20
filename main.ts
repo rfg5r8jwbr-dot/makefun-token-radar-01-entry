@@ -1,4 +1,4 @@
-// Token Radar (radar-2) for make.fun token-radar-01.
+// Token Radar (radar-3) for make.fun token-radar-01.
 //
 // Reads the sealed DefiLlama snapshot at /input/snapshot.json (or --input),
 // scores every pre-token protocol with a comparables model, writes the ranked
@@ -12,9 +12,13 @@
 // chains it runs on. Nothing is hardcoded by name: the multiples come from
 // the snapshot itself, from the live-token protocols in each category.
 //
-//   multiple   = median(mcap / tvl) over live-token protocols in the same
-//                category (at least 3 of them, else the global median),
-//                clamped to [0.05, 1.00]
+//   multiple   = winsorized median(mcap / tvl) over live-token protocols in
+//                the same category, shrunk toward the global median:
+//                (n * category + 3 * global) / (n + 3), clamped to [0.05, 1.00]
+//                (each ratio is winsorized to [0.05, 1.00] first, so one wild
+//                comparable cannot set the multiple, and a thin category is
+//                pulled toward what the whole market pays rather than left on
+//                a single peer's number)
 //   growth     = clamp(change_7d, -50, 100) per cent
 //   growthMult = 1 + growth / 100 * 0.4
 //   maturity   = 0.7 + min(age_days, 1460) / 1460 * 0.3
@@ -44,7 +48,7 @@ const SCREENSHOT_CAPS = { max: 4, max_bytes: 524_288 };
 const IMAGE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** The model's constants, as the dashboard states them. */
 export const MODEL = {
@@ -59,7 +63,7 @@ export const MODEL = {
   breadth_max_chains: 4,
   multiple_floor: 0.05,
   multiple_cap: 1.0,
-  min_comparables: 3,
+  shrink_prior: 3,
 };
 
 export interface SnapshotProtocol {
@@ -147,10 +151,21 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
+export interface PeerRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  mcap_usd: number | null;
+  change_7d: number | null;
+}
+
 export interface Comparable {
   category: string;
   n: number;
   median_multiple: number;
+  effective_multiple: number;
 }
 
 export interface RadarData {
@@ -163,10 +178,12 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  comparable_count: number;
   comparables: Comparable[];
   global_multiple: number;
   rows: RadarRow[];
   live: LiveRow[];
+  peers: PeerRow[];
 }
 
 export class SnapshotError extends Error {
@@ -226,17 +243,30 @@ export function isEarlyEligible(p: SnapshotProtocol): boolean {
   return isPreToken(p) && !isWrappedProduct(p);
 }
 
-/** The market multiple for a category: its live-token median, or the global median when too few trade. */
+/** One comparable ratio, winsorized to the multiple's own range: a single wild peer cannot set a price. */
+function winsorizeRatio(ratio: number): number {
+  return Math.min(MODEL.multiple_cap, Math.max(MODEL.multiple_floor, ratio));
+}
+
+/**
+ * The market multiple for a category: its live-token median, winsorized,
+ * then shrunk toward the global median by (n * category + 3 * global) / (n + 3).
+ * A category with many comparables keeps its own number; a thin one is pulled
+ * toward what the whole market pays instead of standing on one peer's ratio.
+ * `rawMedian` is the winsorized category median before the shrink, or null
+ * when the category has no live-token comparable at all.
+ */
 export function categoryMultiple(
   category: string | null,
   byCategory: Map<string, number[]>,
   globalMultiple: number,
-): { multiple: number; n: number } {
+): { multiple: number; n: number; rawMedian: number | null } {
   const ratios = category === null ? [] : (byCategory.get(category) ?? []);
-  if (ratios.length >= MODEL.min_comparables) {
-    return { multiple: Math.min(MODEL.multiple_cap, Math.max(MODEL.multiple_floor, median(ratios))), n: ratios.length };
-  }
-  return { multiple: Math.min(MODEL.multiple_cap, Math.max(MODEL.multiple_floor, globalMultiple)), n: ratios.length };
+  const winsorized = ratios.map(winsorizeRatio);
+  const rawMedian = winsorized.length > 0 ? median(winsorized) : null;
+  const catMedian = rawMedian ?? globalMultiple;
+  const shrunk = (winsorized.length * catMedian + MODEL.shrink_prior * globalMultiple) / (winsorized.length + MODEL.shrink_prior);
+  return { multiple: Math.min(MODEL.multiple_cap, Math.max(MODEL.multiple_floor, shrunk)), n: ratios.length, rawMedian };
 }
 
 /** The multipliers and the implied value one protocol gets under the model. */
@@ -283,6 +313,139 @@ function holdDaysFor(age: number | null): number {
   return 30;
 }
 
+/**
+ * The farm-plan families: a protocol's category decides the shape of its plan.
+ * A lending position is farmed by supplying and borrowing, a vault by
+ * harvesting and re-depositing, a perp desk by opening and closing hedges —
+ * so the weekly action, the claim surface, the reason to hold and the log
+ * all follow the category, never one shared template.
+ */
+type FarmFamily =
+  | 'lending' | 'dex' | 'vault' | 'staking' | 'perps' | 'prediction'
+  | 'stable' | 'rwa' | 'bridge' | 'insurance' | 'chain' | 'payments'
+  | 'btc' | 'governance' | 'cedefi' | 'generic';
+
+function farmFamily(p: SnapshotProtocol): FarmFamily {
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral') || c.includes('uncollateralized')) return 'lending';
+  if (c.includes('dex')) return 'dex';
+  if (c.includes('curator') || c.includes('allocator') || c.includes('yield') || c.includes('farm') || c.includes('liquidity manager') || c.includes('index') || c.includes('options vault')) return 'vault';
+  if (c.includes('staking') || c.includes('restak')) return 'staking';
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('basis') || c.includes('option') || c.includes('synthetic') || c.includes('interest rate')) return 'perps';
+  if (c.includes('prediction')) return 'prediction';
+  if (c.includes('stable')) return 'stable';
+  if (c.includes('rwa')) return 'rwa';
+  if (c.includes('bridge')) return 'bridge';
+  if (c.includes('insurance')) return 'insurance';
+  if (c.includes('chain')) return 'chain';
+  if (c.includes('payment') || c.includes('card issuer')) return 'payments';
+  if (c.includes('btc') || c.includes('anchor')) return 'btc';
+  if (c.includes('governance')) return 'governance';
+  if (c.includes('cedefi')) return 'cedefi';
+  return 'generic';
+}
+
+/** What a farmer does every week, per family: the recurring action the category itself rewards. */
+const FARM_WEEKLY: Record<FarmFamily, (name: string) => string> = {
+  lending: (name) => `Supply or borrow a small amount on ${name} each week so the position shows fresh activity.`,
+  dex: (name) => `Swap a small amount through ${name}'s main pool each week and leave the liquidity in place.`,
+  vault: (name) => `Harvest ${name}'s yield each week and re-deposit it so the position compounds.`,
+  staking: (name) => `Restake the staking rewards on ${name} each week instead of letting them sit idle.`,
+  perps: (name) => `Open and close one small hedge on ${name} each week so the account stays active.`,
+  prediction: (name) => `Place or settle one small market position on ${name} each week.`,
+  stable: (name) => `Mint or redeem a small amount of the stable asset through ${name} each week.`,
+  rwa: (name) => `Check the yield asset's accrual on ${name} each week and top it up with a small mint.`,
+  bridge: (name) => `Bridge a small amount through ${name} each week, alternating direction.`,
+  insurance: (name) => `Review the cover on ${name} each week and renew or top it up before it lapses.`,
+  chain: (name) => `Use ${name}'s apps each week so the wallet shows activity beyond the bridge.`,
+  payments: (name) => `Route one small payment through ${name} each week.`,
+  btc: (name) => `Top up the BTC position on ${name} with a small amount each week.`,
+  governance: (name) => `Vote on one proposal on ${name} each week while the position is open.`,
+  cedefi: (name) => `Move a small amount through ${name} each week.`,
+  generic: (name) => `Make one qualifying action on ${name} each week, such as a deposit, a borrow, a swap or a vote.`,
+};
+
+/** Where the rewards are claimed, per family: the actual surface, named, not "the points page" for all. */
+const FARM_CLAIM: Record<FarmFamily, (name: string) => string> = {
+  lending: (name) => `open the rewards tab on ${name}'s lending app`,
+  dex: (name) => `open ${name}'s rewards or fee-share page`,
+  vault: (name) => `open ${name}'s vault rewards tab`,
+  staking: (name) => `open ${name}'s staking rewards page`,
+  perps: (name) => `open ${name}'s trading rewards page`,
+  prediction: (name) => `open ${name}'s market rewards or points page`,
+  stable: (name) => `open the stable asset's rewards page on ${name}`,
+  rwa: (name) => `open ${name}'s yield-asset rewards tab`,
+  bridge: (name) => `open ${name}'s points page`,
+  insurance: (name) => `open the policy page on ${name}`,
+  chain: (name) => `open ${name}'s points or rewards page`,
+  payments: (name) => `open ${name}'s rewards page`,
+  btc: (name) => `open ${name}'s rewards tab`,
+  governance: (name) => `open ${name}'s governance page`,
+  cedefi: (name) => `open ${name}'s rewards page`,
+  generic: (name) => `open ${name}'s own points or rewards page`,
+};
+
+/** Why the position is held, per family: what the hold is for, in the category's own terms. */
+const FARM_HOLD: Record<FarmFamily, string> = {
+  lending: 'so the borrow history spans more than one snapshot',
+  dex: 'so the pool position ages past the first snapshot',
+  vault: 'so the vault’s snapshots count the position',
+  staking: 'so the stake ages past the first snapshot',
+  perps: 'so the trading history spans more than one snapshot',
+  prediction: 'so the market activity spans more than one snapshot',
+  stable: 'so the mint ages past the first snapshot',
+  rwa: 'so the holding ages past the first snapshot',
+  bridge: 'so the bridge volume spans more than one snapshot',
+  insurance: 'so the policy covers more than one snapshot',
+  chain: 'so the wallet activity spans more than one snapshot',
+  payments: 'so the payment history spans more than one snapshot',
+  btc: 'so the position ages past the first snapshot',
+  governance: 'so the votes span more than one snapshot',
+  cedefi: 'so the activity spans more than one snapshot',
+  generic: 'so the activity is counted in more than one snapshot',
+};
+
+/** What the farm log records, per family: the figure that proves the position. */
+const FARM_LOG: Record<FarmFamily, string> = {
+  lending: 'Note the supplied amount and each borrow.',
+  dex: 'Note the pool and the price range.',
+  vault: 'Note the vault shares and each harvest.',
+  staking: 'Note the staked amount and each restake.',
+  perps: 'Note the margin and the position size.',
+  prediction: 'Note each market and its outcome.',
+  stable: 'Note each mint and redemption.',
+  rwa: 'Note the yield-asset balance.',
+  bridge: 'Note each bridge direction and amount.',
+  insurance: 'Note the policy number and expiry.',
+  chain: 'Note each app you used.',
+  payments: 'Note each payment’s recipient.',
+  btc: 'Note each top-up.',
+  governance: 'Note each vote.',
+  cedefi: 'Note each transfer.',
+  generic: '',
+};
+
+/** The gas a chain actually charges, so the wallet setup is honest about the chain it runs on. */
+function gasNoteFor(chain: string): { note: string; cost: string; weeklyCost: string } {
+  if (chain === 'Solana') return { note: 'Solana fees are under $0.01 a transaction, so a $2 SOL buffer covers months of activity.', cost: 'under $0.01 of gas for the first transaction', weeklyCost: 'under $0.10 of gas a week' };
+  if (chain === 'Ethereum') return { note: 'Ethereum gas is the dearest here, so keep $10 of ETH aside for fees.', cost: '$10 of ETH for gas', weeklyCost: 'about $5 of gas a week' };
+  if (['Arbitrum', 'Optimism', 'Base', 'Linea', 'Unichain', 'Blast', 'Mode', 'Scroll', 'Zora', 'Ink', 'Soneium', 'World Chain'].includes(chain)) {
+    return { note: `Keep $5 of ETH on ${chain} for gas.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  }
+  if (chain === 'Binance') return { note: `Keep a few dollars of BNB on ${chain} for gas.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  if (chain === 'Avalanche') return { note: `Keep a few dollars of AVAX on ${chain} for gas.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  if (chain === 'Polygon') return { note: `Keep a few dollars of POL on ${chain} for gas.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  if (chain === 'Tron') return { note: `Keep a few dollars of TRX on ${chain} for bandwidth and energy.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  if (chain === 'Hyperliquid L1') return { note: `Keep a few dollars of HYPE on ${chain} for gas.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  if (chain === 'Monad') return { note: `Keep a few dollars of MON on ${chain} for gas.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  if (chain === 'Plasma') return { note: `Keep a few dollars of XPL on ${chain} for gas.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  if (chain === 'Sui') return { note: `Keep a few dollars of SUI on ${chain} for gas.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  if (chain === 'Aptos') return { note: `Keep a few dollars of APT on ${chain} for gas.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  if (chain === 'Near') return { note: `Keep a few dollars of NEAR on ${chain} for gas.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+  if (chain === 'Bitcoin') return { note: 'Keep a small BTC buffer for network fees.', cost: 'a small BTC fee for the first transaction', weeklyCost: 'about $2 of fees a week' };
+  return { note: `Keep a small gas buffer on ${chain}.`, cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+}
+
 function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
   const c = (p.category ?? '').toLowerCase();
   const name = p.name;
@@ -296,25 +459,44 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   if (c.includes('stable')) return `Mint or deposit $${capital} of the stable asset through ${name} on ${chain}.`;
   if (c.includes('rwa')) return `Mint $${capital} of the protocol's yield asset on ${chain} and hold it.`;
   if (c.includes('insurance')) return `Buy $${capital} of cover from ${name} on ${chain} and keep the policy.`;
+  if (c.includes('basis')) return `Open a $${capital} basis trade on ${name} on ${chain} and hold both legs.`;
+  if (c.includes('option')) return `Deposit $${capital} into an ${name} options vault on ${chain} and keep the position open.`;
+  if (c.includes('launchpad')) return `Complete ${name}'s eligibility tasks on ${chain} with $${capital} staked.`;
+  if (c.includes('payment') || c.includes('card issuer')) return `Route $${capital} of payments through ${name} on ${chain}.`;
+  if (c.includes('index')) return `Buy $${capital} of the ${name} index on ${chain} and hold it.`;
+  if (c.includes('locker')) return `Lock $${capital} of tokens in ${name} on ${chain} for the longest term you accept.`;
+  if (c.includes('liquidity')) return `Deposit $${capital} into ${name}'s managed liquidity position on ${chain}.`;
+  if (c.includes('farm')) return `Stake $${capital} of LP tokens in the ${name} farm on ${chain}.`;
+  if (c.includes('chain')) return `Bridge $${capital} of USDC to ${chain} and use it across the chain's apps.`;
+  if (c.includes('btc') || c.includes('anchor')) return `Deposit $${capital} of BTC into ${name} on ${chain} and keep the receipt.`;
+  if (c.includes('governance')) return `Lock $${capital} of governance tokens with ${name} on ${chain} and vote.`;
+  if (c.includes('privacy')) return `Deposit $${capital} into ${name}'s private pool on ${chain}.`;
+  if (c.includes('ai agent') || c.includes('decentralized ai')) return `Fund $${capital} into an ${name} agent on ${chain} and keep it running.`;
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
 /**
  * A protocol's farm plan: six steps, each an action with a cost and a time.
- * Derived from the protocol's own record (category, chains, TVL, age),
- * never from a hand-written list of names.
+ * Every step is derived from the protocol's own record — its category decides
+ * the weekly action, the claim surface, the reason to hold and the log; its
+ * main chain decides the gas note and the weekly gas cost; its TVL decides
+ * the capital and its age decides the hold. No two categories farm alike,
+ * and no name is special-cased.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
+  const family = farmFamily(p);
+  const gas = gasNoteFor(chain);
+  const logNote = FARM_LOG[family];
   return [
-    { text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`, cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
+    { text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. ${gas.note}`, cost: gas.cost, time: '5 minutes' },
     { text: actionFor(p, capital, chain), cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`, time: '15 minutes to set up' },
-    { text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`, cost: 'about $2 of gas a week', time: '10 minutes a week' },
-    { text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`, cost: `the $${capital} stays in the position`, time: `${hold} days` },
-    { text: `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.`, cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-    { text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`, cost: 'nothing but the log', time: '5 minutes' },
+    { text: FARM_WEEKLY[family](p.name), cost: gas.weeklyCost, time: '10 minutes a week' },
+    { text: `Hold the position for at least ${hold} days, ${FARM_HOLD[family]}.`, cost: `the $${capital} stays in the position`, time: `${hold} days` },
+    { text: `Before you withdraw, ${FARM_CLAIM[family](p.name)} and claim only from the link it publishes.`, cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
+    { text: `Write the wallet, the dates and every transaction on ${p.name} in a farm log so you can repeat the position or unwind it.${logNote === '' ? '' : ` ${logNote}`}`, cost: 'nothing but the log', time: '5 minutes' },
   ];
 }
 
@@ -324,6 +506,26 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     .filter((p) => !isPreToken(p) && p.category !== 'CEX')
     .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
     .slice(0, 24)
+    .map((p) => ({
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      chains: p.chains,
+      tvl_usd: p.tvl_usd,
+      mcap_usd: p.mcap_usd,
+      change_7d: p.change_7d,
+    }));
+}
+
+/**
+ * Every live-token protocol with a recorded market cap, by market cap: the
+ * full comparables set the detail view's peers draw from, so the peer that
+ * justifies a multiple is shown even when it is not one of the top 24.
+ */
+export function peerRows(snapshot: Snapshot): PeerRow[] {
+  return snapshot.protocols
+    .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0)
+    .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
     .map((p) => ({
       slug: p.slug,
       name: p.name,
@@ -354,9 +556,14 @@ export function buildBoard(snapshot: Snapshot): { board: BoardRow[]; comparables
       }
     }
   }
-  const globalMultiple = median(liveRatios);
+  // The global median is over winsorized ratios too: the same cap that keeps
+  // one wild comparable from setting a category's multiple.
+  const globalMultiple = median(liveRatios.map(winsorizeRatio));
   const comparables: Comparable[] = [...byCategory.entries()]
-    .map(([category, ratios]) => ({ category, n: ratios.length, median_multiple: round4(median(ratios)) }))
+    .map(([category, ratios]) => {
+      const { multiple } = categoryMultiple(category, byCategory, globalMultiple);
+      return { category, n: ratios.length, median_multiple: round4(median(ratios)), effective_multiple: round4(multiple) };
+    })
     .sort((a, b) => b.n - a.n || (a.category < b.category ? -1 : 1));
 
   const chosen = new Map<string, SnapshotProtocol>();
@@ -434,6 +641,7 @@ export function radarRow(row: BoardRow): RadarRow {
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
   const { board, comparables, globalMultiple } = buildBoard(snapshot);
   const live = liveRows(snapshot);
+  const peers = peerRows(snapshot);
   const early = board.filter((r) => !r.watchlist).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -445,10 +653,12 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     board_size: board.length,
     early_size: early,
     live_size: live.length,
+    comparable_count: peers.length,
     comparables,
     global_multiple: round4(globalMultiple),
     rows: board.map(radarRow),
     live,
+    peers,
   };
   return { board, radar };
 }
