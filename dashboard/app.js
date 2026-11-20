@@ -1,4 +1,4 @@
-// Token Radar (radar-2) dashboard. It reads window.RADAR (written beside
+// Token Radar (radar-3) dashboard. It reads window.RADAR (written beside
 // dashboard/ by main.ts) and renders the ranked board, a filterable table, a
 // per-protocol detail view with the model's own inputs, its live-token peers
 // and the protocol's farm plan. No network: every byte it shows is in data.js.
@@ -7,15 +7,17 @@
 // figures and checks the number board.json carries, so the page's code and
 // the board's data are visibly the same arithmetic. Implied value is
 // TVL x category multiple x growth x maturity x breadth, where the category
-// multiple is the median market-cap-to-TVL ratio of the live-token protocols
-// in that category (at least 3 of them, else the global median).
+// multiple is the winsorized median market-cap-to-TVL ratio of the live-token
+// protocols in that category, shrunk toward the global median by
+// (n x category + 3 x global) / (n + 3), so a thin category is pulled toward
+// what the whole market pays instead of standing on one peer's ratio.
 (function () {
   'use strict';
 
   var DATA = window.RADAR;
   if (!DATA) return;
   var app = document.getElementById('board');
-  var state = { q: '', category: 'all', chain: 'all', minTvl: 0, watchOnly: false, tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
+  var state = { q: '', category: 'all', chain: 'all', minTvl: 0, watchOnly: false, tab: 'pre-token', sort: 'implied', dir: -1, selected: null, liveSort: { key: 'mcap', dir: -1 } };
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -69,7 +71,10 @@
 
   // The farm plan is the same derivation main.ts writes to board.json:
   // category, chains, TVL and age decide the action, the capital, the hold
-  // and every cost and time. No name is special-cased.
+  // and every cost and time. No name is special-cased, and no two categories
+  // farm alike: the weekly action, the claim surface, the reason to hold
+  // and the log all follow the protocol's own category, and the gas note
+  // follows its main chain.
   function chainOf(p) { return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain'; }
   function capitalFor(p) {
     if (p.tvl_usd >= 5e9) return 250;
@@ -82,6 +87,116 @@
     if (age < 180) return 60;
     if (age < 365) return 45;
     return 30;
+  }
+  function farmFamily(p) {
+    var c = (p.category || '').toLowerCase();
+    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0 || c.indexOf('uncollateralized') >= 0) return 'lending';
+    if (c.indexOf('dex') >= 0) return 'dex';
+    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('farm') >= 0 || c.indexOf('liquidity manager') >= 0 || c.indexOf('index') >= 0 || c.indexOf('options vault') >= 0) return 'vault';
+    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return 'staking';
+    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0 || c.indexOf('basis') >= 0 || c.indexOf('option') >= 0 || c.indexOf('synthetic') >= 0 || c.indexOf('interest rate') >= 0) return 'perps';
+    if (c.indexOf('prediction') >= 0) return 'prediction';
+    if (c.indexOf('stable') >= 0) return 'stable';
+    if (c.indexOf('rwa') >= 0) return 'rwa';
+    if (c.indexOf('bridge') >= 0) return 'bridge';
+    if (c.indexOf('insurance') >= 0) return 'insurance';
+    if (c.indexOf('chain') >= 0) return 'chain';
+    if (c.indexOf('payment') >= 0 || c.indexOf('card issuer') >= 0) return 'payments';
+    if (c.indexOf('btc') >= 0 || c.indexOf('anchor') >= 0) return 'btc';
+    if (c.indexOf('governance') >= 0) return 'governance';
+    if (c.indexOf('cedefi') >= 0) return 'cedefi';
+    return 'generic';
+  }
+  var FARM_WEEKLY = {
+    lending: function (name) { return 'Supply or borrow a small amount on ' + name + ' each week so the position shows fresh activity.'; },
+    dex: function (name) { return 'Swap a small amount through ' + name + "'s main pool each week and leave the liquidity in place."; },
+    vault: function (name) { return 'Harvest ' + name + "'s yield each week and re-deposit it so the position compounds."; },
+    staking: function (name) { return 'Restake the staking rewards on ' + name + ' each week instead of letting them sit idle.'; },
+    perps: function (name) { return 'Open and close one small hedge on ' + name + ' each week so the account stays active.'; },
+    prediction: function (name) { return 'Place or settle one small market position on ' + name + ' each week.'; },
+    stable: function (name) { return 'Mint or redeem a small amount of the stable asset through ' + name + ' each week.'; },
+    rwa: function (name) { return "Check the yield asset's accrual on " + name + ' each week and top it up with a small mint.'; },
+    bridge: function (name) { return 'Bridge a small amount through ' + name + ' each week, alternating direction.'; },
+    insurance: function (name) { return 'Review the cover on ' + name + ' each week and renew or top it up before it lapses.'; },
+    chain: function (name) { return 'Use ' + name + "'s apps each week so the wallet shows activity beyond the bridge."; },
+    payments: function (name) { return 'Route one small payment through ' + name + ' each week.'; },
+    btc: function (name) { return 'Top up the BTC position on ' + name + ' with a small amount each week.'; },
+    governance: function (name) { return 'Vote on one proposal on ' + name + ' each week while the position is open.'; },
+    cedefi: function (name) { return 'Move a small amount through ' + name + ' each week.'; },
+    generic: function (name) { return 'Make one qualifying action on ' + name + ' each week, such as a deposit, a borrow, a swap or a vote.'; }
+  };
+  var FARM_CLAIM = {
+    lending: function (name) { return 'open the rewards tab on ' + name + "'s lending app"; },
+    dex: function (name) { return 'open ' + name + "'s rewards or fee-share page"; },
+    vault: function (name) { return 'open ' + name + "'s vault rewards tab"; },
+    staking: function (name) { return 'open ' + name + "'s staking rewards page"; },
+    perps: function (name) { return 'open ' + name + "'s trading rewards page"; },
+    prediction: function (name) { return 'open ' + name + "'s market rewards or points page"; },
+    stable: function (name) { return "open the stable asset's rewards page on " + name; },
+    rwa: function (name) { return 'open ' + name + "'s yield-asset rewards tab"; },
+    bridge: function (name) { return 'open ' + name + "'s points page"; },
+    insurance: function (name) { return 'open the policy page on ' + name; },
+    chain: function (name) { return 'open ' + name + "'s points or rewards page"; },
+    payments: function (name) { return 'open ' + name + "'s rewards page"; },
+    btc: function (name) { return 'open ' + name + "'s rewards tab"; },
+    governance: function (name) { return 'open ' + name + "'s governance page"; },
+    cedefi: function (name) { return 'open ' + name + "'s rewards page"; },
+    generic: function (name) { return 'open ' + name + "'s own points or rewards page"; }
+  };
+  var FARM_HOLD = {
+    lending: 'so the borrow history spans more than one snapshot',
+    dex: 'so the pool position ages past the first snapshot',
+    vault: 'so the vault’s snapshots count the position',
+    staking: 'so the stake ages past the first snapshot',
+    perps: 'so the trading history spans more than one snapshot',
+    prediction: 'so the market activity spans more than one snapshot',
+    stable: 'so the mint ages past the first snapshot',
+    rwa: 'so the holding ages past the first snapshot',
+    bridge: 'so the bridge volume spans more than one snapshot',
+    insurance: 'so the policy covers more than one snapshot',
+    chain: 'so the wallet activity spans more than one snapshot',
+    payments: 'so the payment history spans more than one snapshot',
+    btc: 'so the position ages past the first snapshot',
+    governance: 'so the votes span more than one snapshot',
+    cedefi: 'so the activity spans more than one snapshot',
+    generic: 'so the activity is counted in more than one snapshot'
+  };
+  var FARM_LOG = {
+    lending: 'Note the supplied amount and each borrow.',
+    dex: 'Note the pool and the price range.',
+    vault: 'Note the vault shares and each harvest.',
+    staking: 'Note the staked amount and each restake.',
+    perps: 'Note the margin and the position size.',
+    prediction: 'Note each market and its outcome.',
+    stable: 'Note each mint and redemption.',
+    rwa: 'Note the yield-asset balance.',
+    bridge: 'Note each bridge direction and amount.',
+    insurance: 'Note the policy number and expiry.',
+    chain: 'Note each app you used.',
+    payments: 'Note each payment’s recipient.',
+    btc: 'Note each top-up.',
+    governance: 'Note each vote.',
+    cedefi: 'Note each transfer.',
+    generic: ''
+  };
+  function gasNoteFor(chain) {
+    if (chain === 'Solana') return { note: 'Solana fees are under $0.01 a transaction, so a $2 SOL buffer covers months of activity.', cost: 'under $0.01 of gas for the first transaction', weeklyCost: 'under $0.10 of gas a week' };
+    if (chain === 'Ethereum') return { note: 'Ethereum gas is the dearest here, so keep $10 of ETH aside for fees.', cost: '$10 of ETH for gas', weeklyCost: 'about $5 of gas a week' };
+    if (['Arbitrum', 'Optimism', 'Base', 'Linea', 'Unichain', 'Blast', 'Mode', 'Scroll', 'Zora', 'Ink', 'Soneium', 'World Chain'].indexOf(chain) >= 0) {
+      return { note: 'Keep $5 of ETH on ' + chain + ' for gas.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    }
+    if (chain === 'Binance') return { note: 'Keep a few dollars of BNB on ' + chain + ' for gas.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    if (chain === 'Avalanche') return { note: 'Keep a few dollars of AVAX on ' + chain + ' for gas.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    if (chain === 'Polygon') return { note: 'Keep a few dollars of POL on ' + chain + ' for gas.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    if (chain === 'Tron') return { note: 'Keep a few dollars of TRX on ' + chain + ' for bandwidth and energy.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    if (chain === 'Hyperliquid L1') return { note: 'Keep a few dollars of HYPE on ' + chain + ' for gas.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    if (chain === 'Monad') return { note: 'Keep a few dollars of MON on ' + chain + ' for gas.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    if (chain === 'Plasma') return { note: 'Keep a few dollars of XPL on ' + chain + ' for gas.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    if (chain === 'Sui') return { note: 'Keep a few dollars of SUI on ' + chain + ' for gas.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    if (chain === 'Aptos') return { note: 'Keep a few dollars of APT on ' + chain + ' for gas.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    if (chain === 'Near') return { note: 'Keep a few dollars of NEAR on ' + chain + ' for gas.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
+    if (chain === 'Bitcoin') return { note: 'Keep a small BTC buffer for network fees.', cost: 'a small BTC fee for the first transaction', weeklyCost: 'about $2 of fees a week' };
+    return { note: 'Keep a small gas buffer on ' + chain + '.', cost: 'a few dollars of gas for the first transaction', weeklyCost: 'about $2 of gas a week' };
   }
   function actionFor(p, capital, chain) {
     var c = (p.category || '').toLowerCase();
@@ -96,6 +211,19 @@
     if (c.indexOf('stable') >= 0) return 'Mint or deposit $' + capital + ' of the stable asset through ' + name + ' on ' + chain + '.';
     if (c.indexOf('rwa') >= 0) return "Mint $" + capital + " of the protocol's yield asset on " + chain + ' and hold it.';
     if (c.indexOf('insurance') >= 0) return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy.';
+    if (c.indexOf('basis') >= 0) return 'Open a $' + capital + ' basis trade on ' + name + ' on ' + chain + ' and hold both legs.';
+    if (c.indexOf('option') >= 0) return 'Deposit $' + capital + ' into an ' + name + ' options vault on ' + chain + ' and keep the position open.';
+    if (c.indexOf('launchpad') >= 0) return "Complete " + name + "'s eligibility tasks on " + chain + ' with $' + capital + ' staked.';
+    if (c.indexOf('payment') >= 0 || c.indexOf('card issuer') >= 0) return 'Route $' + capital + ' of payments through ' + name + ' on ' + chain + '.';
+    if (c.indexOf('index') >= 0) return 'Buy $' + capital + ' of the ' + name + ' index on ' + chain + ' and hold it.';
+    if (c.indexOf('locker') >= 0) return 'Lock $' + capital + ' of tokens in ' + name + ' on ' + chain + ' for the longest term you accept.';
+    if (c.indexOf('liquidity') >= 0) return 'Deposit $' + capital + " into " + name + "'s managed liquidity position on " + chain + '.';
+    if (c.indexOf('farm') >= 0) return 'Stake $' + capital + ' of LP tokens in the ' + name + ' farm on ' + chain + '.';
+    if (c.indexOf('chain') >= 0) return 'Bridge $' + capital + ' of USDC to ' + chain + " and use it across the chain's apps.";
+    if (c.indexOf('btc') >= 0 || c.indexOf('anchor') >= 0) return 'Deposit $' + capital + ' of BTC into ' + name + ' on ' + chain + ' and keep the receipt.';
+    if (c.indexOf('governance') >= 0) return 'Lock $' + capital + ' of governance tokens with ' + name + ' on ' + chain + ' and vote.';
+    if (c.indexOf('privacy') >= 0) return 'Deposit $' + capital + " into " + name + "'s private pool on " + chain + '.';
+    if (c.indexOf('ai agent') >= 0 || c.indexOf('decentralized ai') >= 0) return 'Fund $' + capital + ' into an ' + name + ' agent on ' + chain + ' and keep it running.';
     return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.';
   }
   function stepText(step) {
@@ -108,19 +236,26 @@
     var chain = chainOf(p);
     var capital = capitalFor(p);
     var hold = holdDaysFor(p.age_days);
+    var family = farmFamily(p);
+    var gas = gasNoteFor(chain);
+    var logNote = FARM_LOG[family];
     return [
-      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
+      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. ' + gas.note, cost: gas.cost, time: '5 minutes' },
       { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
-      { text: 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.', cost: 'about $2 of gas a week', time: '10 minutes a week' },
-      { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
-      { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-      { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' }
+      { text: FARM_WEEKLY[family](p.name), cost: gas.weeklyCost, time: '10 minutes a week' },
+      { text: 'Hold the position for at least ' + hold + ' days, ' + FARM_HOLD[family] + '.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
+      { text: 'Before you withdraw, ' + FARM_CLAIM[family](p.name) + ' and claim only from the link it publishes.', cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
+      { text: 'Write the wallet, the dates and every transaction on ' + p.name + ' in a farm log so you can repeat the position or unwind it.' + (logNote === '' ? '' : ' ' + logNote), cost: 'nothing but the log', time: '5 minutes' }
     ].map(stepText);
   }
 
   // Live-token peers in the same category: the comparables behind the multiple.
+  // Drawn from the full comparables set main.ts ships (every live-token
+  // protocol with a market cap), so the peer that justifies a multiple is
+  // shown even when it is not one of the top 24 on the Live tab.
   function peersOf(row) {
-    return DATA.live.filter(function (l) { return l.category === row.category; })
+    var pool = DATA.peers && DATA.peers.length ? DATA.peers : DATA.live;
+    return pool.filter(function (l) { return l.category === row.category; })
       .sort(function (a, b) { return (b.mcap_usd || 0) - (a.mcap_usd || 0); })
       .slice(0, 4);
   }
@@ -316,9 +451,29 @@
     );
   }
 
+  function liveSortHeader(key, label) {
+    return el('th', { scope: 'col' },
+      el('button', { type: 'button', onclick: function () { if (state.liveSort.key === key) state.liveSort.dir = -state.liveSort.dir; else { state.liveSort.key = key; state.liveSort.dir = -1; } render(); } },
+        label,
+        state.liveSort.key === key ? el('span', { 'aria-hidden': 'true', text: state.liveSort.dir < 0 ? ' v' : ' ^' }) : null
+      )
+    );
+  }
+
   function liveTable() {
+    var list = DATA.live.slice().sort(function (a, b) {
+      var av, bv;
+      if (state.liveSort.key === 'name') { av = a.name.toLowerCase(); bv = b.name.toLowerCase(); }
+      else if (state.liveSort.key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
+      else if (state.liveSort.key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
+      else if (state.liveSort.key === 'ratio') { av = a.mcap_usd && a.tvl_usd ? a.mcap_usd / a.tvl_usd : -Infinity; bv = b.mcap_usd && b.tvl_usd ? b.mcap_usd / b.tvl_usd : -Infinity; }
+      else { av = a.mcap_usd || 0; bv = b.mcap_usd || 0; }
+      if (av < bv) return -state.liveSort.dir;
+      if (av > bv) return state.liveSort.dir;
+      return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
+    });
     var tbody = el('tbody');
-    DATA.live.forEach(function (r) {
+    list.forEach(function (r) {
       tbody.appendChild(el('tr', null,
         el('td', { class: 'num', text: 'live' }),
         el('td', null, el('div', { class: 'name' }, el('b', { text: r.name }), el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') }))),
@@ -333,7 +488,15 @@
       el('div', { class: 'table-wrap' },
         el('table', null,
           el('caption', { class: 'sub', text: 'Token live: these protocols already trade, so their market cap is a fact, not a model. They are set aside from the pre-token ranking, and their market-cap-to-TVL ratios are the comparables the model prices the board with.' }),
-          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Status' }), el('th', { scope: 'col', text: 'Protocol' }), el('th', { scope: 'col', text: 'TVL' }), el('th', { scope: 'col', text: '7d' }), el('th', { scope: 'col', text: 'Market cap' }), el('th', { scope: 'col', text: 'Mcap / TVL' }), el('th', { scope: 'col', text: 'Token' }))),
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'Status' }),
+            liveSortHeader('name', 'Protocol'),
+            liveSortHeader('tvl', 'TVL'),
+            liveSortHeader('growth', '7d'),
+            liveSortHeader('mcap', 'Market cap'),
+            liveSortHeader('ratio', 'Mcap / TVL'),
+            el('th', { scope: 'col', text: 'Token' })
+          )),
           tbody
         )
       )
@@ -350,12 +513,12 @@
         'implied = round( tvl_usd x category multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + min(chains - 1, ' + m.breadth_max_chains + ') x ' + m.breadth_step + ') )'
       ),
       el('div', { class: 'model-grid' },
-        el('div', { class: 'model-cell' }, el('span', { text: 'Global multiple' }), el('b', { text: fmtMult(DATA.global_multiple) + ' (median of ' + DATA.live.length + ' live tokens shown)' })),
+        el('div', { class: 'model-cell' }, el('span', { text: 'Global multiple' }), el('b', { text: fmtMult(DATA.global_multiple) + ' (median of ' + DATA.comparable_count + ' live-token protocols with a market cap)' })),
         el('div', { class: 'model-cell' }, el('span', { text: 'Multiple range' }), el('b', { text: fmtMult(m.multiple_floor) + ' to ' + fmtMult(m.multiple_cap) })),
         el('div', { class: 'model-cell' }, el('span', { text: 'Growth weight' }), el('b', { text: String(m.growth_weight) + ', clamped ' + m.growth_floor + '% to +' + m.growth_cap + '%' })),
         el('div', { class: 'model-cell' }, el('span', { text: 'Age' }), el('b', { text: 'listed date to ' + DATA.as_of + '; unknown uses ' + m.unknown_age_days + 'd' }))
       ),
-      el('p', { class: 'sub', text: 'Category multiples with at least 3 live-token comparables: ' + topCats.map(function (c) { return c.category + ' ' + fmtMult(c.median_multiple) + ' (n=' + c.n + ')'; }).join(', ') + '. A category with fewer than 3 comparables uses the global median.' }),
+      el('p', { class: 'sub', text: 'Effective category multiples, each category\u2019s median pulled toward the global median when it has few comparables: ' + topCats.map(function (c) { return c.category + ' ' + fmtMult(c.effective_multiple) + ' (n=' + c.n + ')'; }).join(', ') + '. A thin category is shrunk toward the global median: multiple = (n x category median + ' + m.shrink_prior + ' x global median) / (n + ' + m.shrink_prior + '), over ratios winsorized to 0.05-1.00, so one wild comparable cannot set the multiple.' }),
       el('p', { class: 'sub', text: 'Age is the time since the protocol was first listed, the best record of how long it has run with no token. The early radar applies the watchlist rule below the floor: no bridge, liquid staking or restaking product, no versioned pool, no wrapped or staked product, no exchange-branded name.' }),
       el('div', { class: 'note', text: 'Say it plainly: a protocol records no token, never that it has none. A token may already exist that the snapshot does not carry, and no row here predicts whether or when a token launches. Implied value is this model\u2019s claim, not a price, and farming never guarantees an airdrop.' })
     );
@@ -374,9 +537,10 @@
     var steps = farmSteps(row);
     var peers = peersOf(row);
     var comp = comparableOf(row.category);
-    var multipleNote = comp && comp.n >= DATA.model.min_comparables
-      ? '(n=' + comp.n + ' live-token peers)'
-      : '(global median; only ' + (comp ? comp.n : 0) + ' live-token peer' + (comp && comp.n === 1 ? '' : 's') + ' in this category)';
+    var multipleNote;
+    if (!comp || comp.n === 0) multipleNote = 'No live-token peer in this category, so the multiple is the global median ' + fmtMult(DATA.global_multiple) + '.';
+    else if (comp.n >= 3) multipleNote = 'Category median ' + fmtMult(comp.median_multiple) + ' over n=' + comp.n + ' live-token peers, shrunk toward the global median ' + fmtMult(DATA.global_multiple) + '.';
+    else multipleNote = 'Only ' + comp.n + ' live-token peer' + (comp.n === 1 ? '' : 's') + ' in this category, so the multiple is shrunk toward the global median ' + fmtMult(DATA.global_multiple) + '.';
     var recomputed = impliedOf(row, DATA.model);
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
@@ -390,7 +554,7 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: fmtMult(row.category_multiple) + ' ' + multipleNote })),
+        el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: fmtMult(row.category_multiple) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
@@ -398,7 +562,8 @@
         el('div', null, el('span', { text: 'Chains (' + (row.chains || []).length + ')' }), el('b', { class: 'num', text: 'x' + row.breadth_multiplier })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+      el('p', { class: 'sub equation-note', text: multipleNote }),
+      el('p', { class: 'sub', text: 'The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') })
     ));
     if (peers.length > 0) {
       var peerBody = el('tbody');
@@ -412,7 +577,7 @@
       });
       dialog.appendChild(el('section', { class: 'detail-section' },
         el('h3', { text: 'Live-token peers in ' + (row.category || 'this category') }),
-        el('p', { class: 'sub', text: 'These protocols already trade. Their market-cap-to-TVL ratios are the comparables behind the ' + fmtMult(row.category_multiple) + ' multiple.' }),
+        el('p', { class: 'sub', text: 'Their market-cap-to-TVL ratios are the comparables behind the ' + fmtMult(row.category_multiple) + ' multiple.' }),
         el('div', { class: 'table-wrap' },
           el('table', { class: 'peers' },
             el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Protocol' }), el('th', { scope: 'col', text: 'TVL' }), el('th', { scope: 'col', text: 'Market cap' }), el('th', { scope: 'col', text: 'Mcap / TVL' }))),
@@ -429,7 +594,7 @@
         var tail = at >= 0 ? s.slice(at + 1) : '';
         return el('li', null, el('b', { text: action }), el('span', { class: 'cost', text: tail }));
       })),
-      el('p', { class: 'sub', text: 'No step promises a token or an airdrop. Never pay to claim, and claim only from the link the protocol itself publishes.' })
+      el('p', { class: 'sub', text: 'No step promises a token or an airdrop. Never pay to claim.' })
     ));
     if (typeof dialog.showModal === 'function') {
       if (!dialog.open) dialog.showModal();

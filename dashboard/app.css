@@ -155,30 +155,35 @@ tbody tr[data-selected="true"] { background: var(--accent-soft); box-shadow: ins
 }
 dialog.detail {
   border: 1px solid var(--border); border-radius: var(--radius-panel);
-  padding: 0; width: min(680px, 94vw); max-height: 88vh; overflow: auto;
+  padding: 0; width: min(880px, 94vw); max-height: 88vh; overflow: auto;
   background: var(--surface); color: var(--ink);
 }
 dialog.detail::backdrop { background: rgba(20, 32, 27, 0.45); }
 .detail-head {
   display: flex; gap: var(--step-3); justify-content: space-between; align-items: start;
-  padding: var(--step-5); padding-bottom: 0;
+  padding: var(--step-2) var(--step-5); padding-bottom: 0;
 }
 .detail-head h2 { margin-top: 5px; }
 .detail-head .sub { margin-top: 4px; }
 .close { border: 1px solid var(--border); background: var(--surface-soft); border-radius: var(--radius-control); padding: 7px 12px; font-weight: 650; }
-.detail-section { padding: var(--step-4) var(--step-5); border-top: 1px solid var(--border); margin-top: var(--step-4); }
-.detail-section:first-of-type { margin-top: var(--step-4); }
-.detail-section h3 { margin-bottom: var(--step-3); }
-.equation { display: grid; grid-template-columns: 1fr 1fr; gap: var(--step-2) var(--step-5); }
-.equation > div { display: flex; justify-content: space-between; gap: var(--step-3); border-bottom: 1px dashed var(--border); padding-bottom: 6px; }
+.detail-section { padding: 6px var(--step-5); border-top: 1px solid var(--border); margin-top: var(--step-2); }
+.detail-section:first-of-type { margin-top: var(--step-2); }
+.detail-section h3 { margin-bottom: var(--step-2); }
+.equation { display: grid; grid-template-columns: 1fr 1fr; gap: 6px var(--step-5); }
+.equation > div { display: flex; justify-content: space-between; gap: var(--step-3); border-bottom: 1px dashed var(--border); padding-bottom: 3px; }
 .equation span { color: var(--muted); font-size: 13.5px; }
 .equation b { font-family: var(--font-num); }
-.steps { margin: 0; padding-left: 20px; display: grid; gap: var(--step-3); }
+/* The value cell holds a bare number, never a sentence: the long multiple
+   note lives on its own footnote line below, so nothing is clipped at the
+   dialog's edge. Values may wrap rather than overflow. */
+.equation .num { white-space: normal; overflow-wrap: anywhere; text-align: right; }
+.equation-note { margin-top: var(--step-2); }
+.steps { margin: 0; padding-left: 20px; display: grid; grid-template-columns: 1fr 1fr; column-gap: var(--step-5); row-gap: 6px; font-size: 13.5px; line-height: 1.4; }
 .steps li::marker { font-weight: 700; color: var(--accent); }
 .steps b { display: block; font-weight: 600; }
 .steps .cost { color: var(--muted); font-size: 13.5px; }
 .peers { width: 100%; min-width: 0; }
-.peers th, .peers td { padding: 8px 10px; }
+.peers th, .peers td { padding: 5px 8px; }
 .spot { display: flex; gap: var(--step-2); flex-wrap: wrap; margin-top: var(--step-3); }
 .chip {
   background: var(--surface-soft); border: 1px solid var(--border);
@@ -190,6 +195,7 @@ footer.foot p + p { margin-top: 6px; }
 @media (max-width: 760px) {
   .lede { grid-template-columns: 1fr; }
   .equation { grid-template-columns: 1fr; }
+  .steps { grid-template-columns: 1fr; }
   h1 { font-size: 24px; }
   .count { margin-left: 0; }
 }
